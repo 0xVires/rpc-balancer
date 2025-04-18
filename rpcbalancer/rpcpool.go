@@ -2,7 +2,6 @@ package rpcbalancer
 
 import (
 	"bytes"
-	//"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,30 +18,40 @@ type node struct {
 	URI     string
 	Client  *fasthttp.Client
 	Healthy bool
-
-	mu sync.RWMutex
+	Height  int64
+	mu      sync.RWMutex
 }
 
 func NewNode(addr string) *node {
-
 	metrics.SetHealth(addr, true)
 	return &node{
-		Client: &fasthttp.Client{
-			// Addr:                host,
-			// IsTLS:               true,
-			// MaxIdleConnDuration: fasthttp.DefaultMaxIdleConnDuration,
-		},
+		Client:  &fasthttp.Client{},
 		Healthy: true,
 		URI:     addr,
+		Height:  0,
 	}
 }
 
+// SetHealthy sets the health status of the node.
 func (n *node) SetHealthy(healthy bool) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
+	changed := n.Healthy != healthy
 	n.Healthy = healthy
-	metrics.SetHealth(n.URI, healthy)
+	n.mu.Unlock()
+
+	if changed {
+		metrics.SetHealth(n.URI, healthy)
+		log.WithFields(logrus.Fields{
+			"node":    n.URI,
+			"healthy": healthy,
+		}).Info("Node health status changed")
+	}
+}
+
+func (n *node) SetHeight(height int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.Height = height
 }
 
 type Pool struct {
@@ -58,7 +67,7 @@ func NewPool(selectionMethod string) *Pool {
 	return &Pool{
 		Nodes:           make(map[int]*node),
 		SelectionMethod: selectionMethod,
-		RoundRobinChan:  make(chan *node, 1000), // setting a buffer size of 1000 to avoid blocking. This is a temporary fix and should be replaced with a more robust solution
+		RoundRobinChan:  make(chan *node, 1000),
 		mu:              sync.RWMutex{},
 	}
 }
@@ -89,13 +98,10 @@ func (p *Pool) getNodeByFailoverOrder() (*node, bool) {
 	defer p.mu.RUnlock()
 
 	for i := 0; i < len(p.Nodes); i++ {
-		// DEBUGGING ONLY
-		// log.Print(p.Nodes[i].URI, p.Nodes[i].Healthy)
-		if p.Nodes[i].Healthy {
-			return p.Nodes[i], false
+		if node, exists := p.Nodes[i]; exists && node.Healthy {
+			return node, false
 		}
 	}
-
 	return p.Fallback, true
 }
 
@@ -110,7 +116,6 @@ func (p *Pool) getNodeByRoundRobin() (*node, bool) {
 			return n, false
 		}
 	}
-
 	return p.Fallback, true
 }
 
@@ -130,17 +135,13 @@ func (p *Pool) getNodeByRandom() (*node, bool) {
 			return p.Nodes[k], false
 		}
 	}
-
 	return p.Fallback, true
 }
 
 func (p *Pool) HandleRequest(ctx *fasthttp.RequestCtx) {
-	// Update the request for the backend server
 	req := &ctx.Request
 
-	// Unmarshal the request body into a struct for caching
 	var jRPCReq jsonRPCPayload
-
 	err := json.Unmarshal(ctx.PostBody(), &jRPCReq)
 	if err != nil {
 		ctx.Error("Failed to unmarshal request: "+err.Error(), 520)
@@ -148,15 +149,12 @@ func (p *Pool) HandleRequest(ctx *fasthttp.RequestCtx) {
 			"error":    err,
 			"req_body": string(ctx.PostBody()),
 		}).Error("Failed to unmarshal request.")
-		// update request metrics
 		go metrics.IncrementInvalidRequests()
 		return
 	}
 
-	// update request metrics
 	go metrics.IncrementTotalRequests(jRPCReq.Method)
 
-	// Get the client to use for the request
 	for {
 		node, fallback := p.getHealthyNode()
 		if fallback && node == nil {
@@ -170,8 +168,6 @@ func (p *Pool) HandleRequest(ctx *fasthttp.RequestCtx) {
 			"is_fallback": fallback,
 		}).Debug("selected node")
 
-		// Set the request host to the backend server
-		//req.Header.SetHost(node.Client.Addr)
 		req.Header.Set("X-Forwarded-For", ctx.RemoteIP().String())
 		ctx.Request.SetRequestURI(node.URI)
 
@@ -179,78 +175,114 @@ func (p *Pool) HandleRequest(ctx *fasthttp.RequestCtx) {
 			req.Header.SetBytesKV(key, value)
 		})
 
-		// Copy the request body, if any
 		if len(ctx.PostBody()) > 0 {
 			req.SetBody(ctx.PostBody())
 		}
 
-		// Make a request to the backend server
 		resp := fasthttp.AcquireResponse()
 		err := node.Client.Do(req, resp)
+
 		if err != nil {
+			fasthttp.ReleaseResponse(resp)
 			switch fallback {
 			case true:
-				ctx.Error("Request failed at fallback: ", 521)
-				log.WithFields(logrus.Fields{
-					"error": err,
-				}).Error("Request failed at fallback")
+				ctx.Error("Request failed at fallback: "+err.Error(), 521)
+				log.WithFields(logrus.Fields{"error": err}).Error("Request failed at fallback")
 				return
 			default:
 				node.SetHealthy(false)
 				log.WithFields(logrus.Fields{
 					"node":    node.URI,
 					"healthy": node.Healthy,
+					"error":   err,
 				}).Error("Request failed. Node set to unhealthy.")
 				continue
 			}
 		}
 
 		if resp.StatusCode() != 200 {
+			statusCode := resp.StatusCode()
+			respBody := resp.Body()
+			fasthttp.ReleaseResponse(resp)
 			switch fallback {
 			case true:
-				ctx.Error("Request failed at fallback: ", 521)
-				log.WithFields(logrus.Fields{
-					"http_status_code": resp.StatusCode(),
-				}).Error("Request failed at fallback")
+				ctx.Error(fmt.Sprintf("Request failed at fallback, status: %d", statusCode), 521)
+				log.WithFields(logrus.Fields{"http_status_code": statusCode}).Error("Request failed at fallback")
 				return
 			default:
 				node.SetHealthy(false)
 				log.WithFields(logrus.Fields{
-					"http_status_code": resp.StatusCode(),
+					"node":             node.URI,
+					"http_status_code": statusCode,
+					"response_body":    string(respBody),
 				}).Error("Request failed. Node set to unhealthy.")
 				continue
 			}
 		}
 
-		// Write the response back to the client
 		ctx.Response.SetStatusCode(resp.StatusCode())
 		ctx.Response.SetBody(resp.Body())
-
 		resp.Header.VisitAll(func(key, value []byte) {
 			ctx.Response.Header.SetBytesKV(key, value)
 		})
+		fasthttp.ReleaseResponse(resp)
 		log.Info("Request succeeded")
 		return
 	}
 }
 
+// StartHealthCheckLoop periodically checks node health, allowing recovery for lagging nodes.
 func (p *Pool) StartHealthCheckLoop(frequency int) {
+	const blockLagTolerance int64 = 50
+
+	log.Infof("Starting health check loop: frequency=%ds, lag_tolerance=%d", frequency, blockLagTolerance)
+
 	for {
+		p.mu.RLock()
+		nodesToCheck := make([]*node, 0, len(p.Nodes))
 		for _, n := range p.Nodes {
-			if !n.Healthy {
-				height, err := GetBlockHeight(n.URI)
-				if err != nil {
-					log.WithFields(logrus.Fields{
-						"error": err,
-						"node":  n.URI,
-					}).Error("Error getting block height")
+			nodesToCheck = append(nodesToCheck, n)
+		}
+		p.mu.RUnlock()
+
+		var maxHeight int64 = 0
+		heightCheckSuccess := make(map[*node]bool, len(nodesToCheck))
+
+		// Pass 1: Fetch heights, handle fetch errors
+		for _, n := range nodesToCheck {
+			height, err := GetBlockHeight(n.URI)
+			if err != nil {
+				log.WithFields(logrus.Fields{"error": err, "node": n.URI}).Warn("HealthCheck: GetBlockHeight failed")
+				n.SetHealthy(false)
+				heightCheckSuccess[n] = false
+			} else {
+				n.SetHeight(height)
+				heightCheckSuccess[n] = true
+				if height > maxHeight {
+					maxHeight = height
+				}
+				metrics.BlockHeight.Set(float64(height))
+			}
+		}
+
+		// Pass 2: Evaluate lag for nodes that successfully reported height
+		log.Debugf("HealthCheck: Max height found: %d", maxHeight)
+		for _, n := range nodesToCheck {
+			if success := heightCheckSuccess[n]; success {
+				if maxHeight > 0 && (maxHeight-n.Height) > blockLagTolerance {
+					// Node is lagging
 					n.SetHealthy(false)
+					log.WithFields(logrus.Fields{
+						"node": n.URI, "height": n.Height, "maxHeight": maxHeight, "lag": maxHeight - n.Height,
+					}).Warn("HealthCheck: Node lagging")
 				} else {
+					// Node is not lagging, mark healthy (enables recovery)
 					n.SetHealthy(true)
-					metrics.BlockHeight.Set(float64(height))
 				}
 			}
 		}
+		log.Debug("HealthCheck: Cycle finished.")
+
 		time.Sleep(time.Duration(frequency) * time.Second)
 	}
 }
@@ -278,11 +310,9 @@ func GetBlockHeight(target string) (int64, error) {
 	}
 
 	req, err := http.NewRequest("POST", target, bytes.NewBuffer(requestBody))
-
 	if err != nil {
 		return 0, err
 	}
-
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{}
@@ -290,16 +320,12 @@ func GetBlockHeight(target string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-
-	if resp.StatusCode == 429 {
-		return 0, fmt.Errorf("rate limited")
-	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		return 0, fmt.Errorf("http_status_code: %d", resp.StatusCode)
 	}
 
-	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return 0, err
@@ -311,7 +337,19 @@ func GetBlockHeight(target string) (int64, error) {
 		return 0, err
 	}
 
-	blockHeight, err := hexStringToInt64(result["result"].(string))
+	if result["error"] != nil {
+		return 0, fmt.Errorf("rpc error: %v", result["error"])
+	}
+	if result["result"] == nil {
+		return 0, fmt.Errorf("rpc result is null")
+	}
+
+	resultStr, ok := result["result"].(string)
+	if !ok {
+		return 0, fmt.Errorf("rpc result is not a string: %T", result["result"])
+	}
+
+	blockHeight, err := hexStringToInt64(resultStr)
 	if err != nil {
 		return 0, err
 	}
